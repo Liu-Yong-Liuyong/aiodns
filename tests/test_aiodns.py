@@ -48,6 +48,20 @@ if sys.version_info >= (3, 14):
 
 
 class DNSTest(unittest.TestCase):
+    #setUp() 會由測試框架 unittest 自動呼叫
+    #setUp() 不是整個 Test Suite 只執行一次，而是每個 Test Case 都會執行一次。
+    '''
+    ex:
+        pytest 找到 test_query_a()
+        unittest 執行 setUp()
+        建立 Event Loop、DNSResolver
+        執行 test_query_a()
+        發出 DNS 查詢並驗證結果
+        unittest 執行 tearDown()
+        關閉 DNSResolver
+        執行 Cleanup
+        關閉 Event Loop
+    '''
     def setUp(self) -> None:
         if sys.platform == 'win32':
             if sys.version_info >= (3, 14):
@@ -60,37 +74,61 @@ class DNSTest(unittest.TestCase):
                 self.loop = asyncio.new_event_loop()
         else:
             self.loop = asyncio.new_event_loop()
-        self.addCleanup(self.loop.close)
+        self.addCleanup(self.loop.close) #當這個 Test Case 結束時，記得呼叫 self.loop.close()。
         self.resolver = aiodns.DNSResolver(loop=self.loop, timeout=5.0)
         self.resolver.nameservers = ['8.8.8.8']
 
     def tearDown(self) -> None:
-        self.loop.run_until_complete(self.resolver.close())
+        # 測試結束後先關閉 Resolver，再由 Cleanup 關閉 Event Loop
+        self.loop.run_until_complete(self.resolver.close())#讓 Event Loop 執行並等待 Resolver 的關閉作業完成。
         self.resolver = None  # type: ignore[assignment]
-
+    '''
+    發起查詢時：建立 Future、Callback，並交給 pycares。
+    DNS 查詢完成時：pycares 呼叫 cb()，透過 call_soon_threadsafe() 排程 _callback()。
+    Event Loop 執行排程工作時：真正執行 _callback()，完成 Future。
+    Future 完成後：等待它的 Coroutine 會被排程恢復執行。
+    '''
     def test_query_a(self) -> None:
-        f = self.resolver.query('google.com', 'A')
-        result = self.loop.run_until_complete(f)
+        f = self.resolver.query('google.com', 'A') #query() 是 aiodns 保留的相容性 API，會將 DNS 查詢結果轉換成舊版資料格式。
+        result = self.loop.run_until_complete(f) #啟動event loop，等待 Future 完成
         self.assertTrue(result)
         self.assertIsInstance(result, list)
-        self.assertIsInstance(result[0], AresQueryAResult)
+        self.assertIsInstance(result[0], AresQueryAResult) #確認 List 裡的第一個元素是 AresQueryAResult 物件。
 
     def test_query_async_await(self) -> None:
-        async def f() -> list[AresQueryAResult]:
+        async def f() -> list[AresQueryAResult]: #它會建立一個 Coroutine Object，但不會立即執行函式裡面的 DNS 查詢。
             return await self.resolver.query('google.com', 'A')
-
-        result = self.loop.run_until_complete(f())
+        #Event Loop 執行 f() 的內容：呼叫 resolver.query()，發起 DNS 查詢並取得 Future。
+        #遇到 await future：如果 Future 尚未完成，Coroutine 暫停，Event Loop 可以處理其他工作。
+        #Future 完成：Event Loop 排程恢復這個 Task，讓 f() 回傳結果。
+        result = self.loop.run_until_complete(f()) 
         self.assertTrue(result)
         self.assertIsInstance(result, list)
         self.assertIsInstance(result[0], AresQueryAResult)
 
+    #這個測試實際上只驗證：如果拋出了 DNSError，那麼它的錯誤碼必須是 ARES_ENOTFOUND。
     def test_query_a_bad(self) -> None:
         f = self.resolver.query('hgf8g2od29hdohid.com', 'A')
         try:
             self.loop.run_until_complete(f)
         except aiodns.error.DNSError as e:
+            #ARES_ENOTFOUND 表示 DNS 查詢沒有找到指定的名稱或紀錄。如果錯誤碼相符，Assertion 就會通過。
             self.assertEqual(e.args[0], aiodns.error.ARES_ENOTFOUND)
+        # 注意：若查詢意外成功，此測試不會失敗
+        # 因為沒有明確驗證 DNSError 必須被拋出
+    '''
+    #確保：DNS 查詢一定要拋出 DNSError。
+    def test_query_a_bad(self) -> None:
+        f = self.resolver.query('hgf8g2od29hdohid.com', 'A')
 
+        with self.assertRaises(aiodns.error.DNSError) as cm:
+            self.loop.run_until_complete(f)
+
+        self.assertEqual(
+            cm.exception.args[0],
+            aiodns.error.ARES_ENOTFOUND
+        )
+    '''
     def test_query_aaaa(self) -> None:
         f = self.resolver.query('ipv6.google.com', 'AAAA')
         result = self.loop.run_until_complete(f)
@@ -166,13 +204,49 @@ class DNSTest(unittest.TestCase):
         )
 
     def test_query_cancel(self) -> None:
+        '''
+        resolver.query() 發起 DNS 查詢，回傳 Future f。
+        resolver.cancel() 要求底層 Resolver 取消尚未完成的 DNS 查詢。
+        run_until_complete(f) 啟動 Event Loop，等待 Future 完成。
+        預期 pycares 透過 Callback 回報 ARES_ECANCELLED。
+        aiodns 將錯誤轉換成 DNSError，並設定到 Future。
+        測試捕捉 DNSError，確認錯誤碼為 ARES_ECANCELLED。
+        '''
         f = self.resolver.query('google.com', 'A')
-        self.resolver.cancel()
+        self.resolver.cancel() #要求底層 Channel 取消其未完成的查詢
         try:
             self.loop.run_until_complete(f)
-        except aiodns.error.DNSError as e:
+        except aiodns.error.DNSError as e: #預期的error是DNS error
             self.assertEqual(e.args[0], aiodns.error.ARES_ECANCELLED)
+    '''
+    #避免如果 Future 意外成功完成，就不會進入 except的情形
+    def test_query_cancel(self) -> None:
+        f = self.resolver.query('google.com', 'A')
+        self.resolver.cancel()
 
+        with self.assertRaises(aiodns.error.DNSError) as cm:
+            self.loop.run_until_complete(f)
+
+        self.assertEqual(
+            cm.exception.args[0],
+            aiodns.error.ARES_ECANCELLED
+        )
+    '''
+    #取消單一future
+    def test_future_cancel(self) -> None:
+        f = self.resolver.query('google.com', 'A')
+        f.cancel() #直接把這個 Future 設為 Cancelled。不等於取消底層 DNS 查詢。
+
+        async def coro() -> None:
+            await asyncio.sleep(0.1) #讓 Event Loop 運作一段時間。
+            await f #因為 Future 已取消，會拋出 asyncio.CancelledError。
+
+        try:
+            self.loop.run_until_complete(coro())
+        except asyncio.CancelledError as e:
+            self.assertTrue(e)
+    '''
+    #避免如果 Future 意外成功完成，就不會進入 except的情形
     def test_future_cancel(self) -> None:
         f = self.resolver.query('google.com', 'A')
         f.cancel()
@@ -181,11 +255,12 @@ class DNSTest(unittest.TestCase):
             await asyncio.sleep(0.1)
             await f
 
-        try:
+        with self.assertRaises(asyncio.CancelledError):
             self.loop.run_until_complete(coro())
-        except asyncio.CancelledError as e:
-            self.assertTrue(e)
 
+        self.assertTrue(f.cancelled())
+    '''
+    #同一個 DNSResolver 能否依序執行兩次 DNS 查詢，並且兩次都成功取得結果。not concurrent
     def test_query_twice(self) -> None:
         async def coro(self: DNSTest) -> None:
             for _ in range(2):
@@ -193,6 +268,25 @@ class DNSTest(unittest.TestCase):
                 self.assertTrue(result)
 
         self.loop.run_until_complete(coro(self))
+    '''
+    def test_query_concurrent(self) -> None:
+        async def coro() -> None:
+            # 先發起兩筆查詢，不立即等待
+            future_a = self.resolver.query_dns('google.com', 'A')
+            future_b = self.resolver.query_dns('example.com', 'A')
+
+            # 等待兩筆查詢都完成
+            result_a, result_b = await asyncio.gather(
+                future_a,
+                future_b,
+            )
+
+            self.assertIsNotNone(result_a)
+            self.assertIsNotNone(result_b)
+
+        self.loop.run_until_complete(coro())
+    The existing test_query_twice test executes two DNS queries sequentially, as each query is awaited before the next one starts. Additional tests could verify multiple pending queries and out-of-order callback completion.
+    '''
 
     def test_gethostbyname(self) -> None:
         with warnings.catch_warnings():
@@ -511,6 +605,7 @@ async def test_close_resolver() -> None:
     assert len(resolver._read_fds) == 0
     assert len(resolver._write_fds) == 0
 
+    #驗證 Pending Query 收到取消錯誤
     # The query should fail with cancellation
     with pytest.raises(aiodns.error.DNSError) as exc_info:
         await query_future
@@ -524,13 +619,13 @@ async def test_close_resolver_multiple_times() -> None:
 
     # Close multiple times
     await resolver.close()
-    await resolver.close()
-    await resolver.close()
+    await resolver.close() #應安全返回
+    await resolver.close() #應安全返回
 
     # All closes should succeed without error
     assert resolver._closed
 
-
+#接下來這三個測試都沒有呼叫 resolver.close()，而是在驗證 Destructor 的自動 Cleanup；真正的差別是 Resolver 被銷毀時 Event Loop 的狀態。
 def test_del_with_no_running_loop() -> None:
     """Test __del__ when there's no running event loop."""
     loop = asyncio.new_event_loop()
@@ -545,17 +640,18 @@ def test_del_with_no_running_loop() -> None:
         cleanup_called = True
         original_close()
 
+    #Resolver 的清理流程呼叫 channel.close() 時，測試就能偵測到。
     resolver._channel.close = mock_close  # type: ignore[method-assign]
-    loop.close()
+    loop.close() #它刻意讓 Event Loop 處於 Closed 狀態，模擬 Resolver 被刪除時，已經無法依靠正常運作的 Event Loop 執行非同步清理的情境。
 
     # Delete the resolver without closing it
     del resolver
-    gc.collect()
+    gc.collect() #主動要求 Python 執行 Garbage Collection。
 
     # Should have called cleanup
-    assert cleanup_called
+    assert cleanup_called #如果resolver的destructor有呼叫self._channel.close()，就會觸發前面替換的mock_close()，進而驗證 Cleanup 有執行
 
-
+#可能可以重寫涵蓋stop的情形
 def test_del_with_stopped_event_loop() -> None:
     """Test __del__ when event loop is not running."""
     # Create a new event loop
@@ -585,11 +681,11 @@ def test_del_with_stopped_event_loop() -> None:
     # Should have called cleanup
     assert cleanup_called
 
-
+#與之前兩個 Destructor Tests 不同，這個測試在執行時有一個正在運作的 Event Loop。
 @pytest.mark.asyncio
 async def test_del_with_running_event_loop() -> None:
     """Test __del__ when event loop is running performs cleanup."""
-    resolver = aiodns.DNSResolver()
+    resolver = aiodns.DNSResolver()#使用目前的 Event Loop。
 
     # Mark that cleanup was called by checking if channel.close was called
     original_close = resolver._channel.close
@@ -614,17 +710,19 @@ async def test_del_with_running_event_loop() -> None:
 async def test_cleanup_method() -> None:
     """Test that _cleanup() properly cleans up resources."""
     resolver = aiodns.DNSResolver()
-
+    #直接在 Resolver 的集合裡放入測試用 FD 編號。
     # Mock file descriptors and timer
     resolver._read_fds.add(1)
     resolver._read_fds.add(2)
     resolver._write_fds.add(3)
     resolver._write_fds.add(4)
 
+    #用 MagicMock 模擬 Timer。當_cleanup()執行self._timer.cancel()時，mock會記錄cancel()被呼叫
     # Mock timer
     mock_timer = unittest.mock.MagicMock()
     resolver._timer = mock_timer
 
+    #沒有替換整個 Event Loop，只是把其中兩個方法替換成 MagicMock()，避免真的操作 Event Loop 的 Socket 監聽，同時記錄 _cleanup() 是否呼叫正確的方法。
     # Mock loop methods
     resolver.loop.remove_reader = unittest.mock.MagicMock()  # type: ignore[method-assign]
     resolver.loop.remove_writer = unittest.mock.MagicMock()  # type: ignore[method-assign]
@@ -941,28 +1039,36 @@ def test_nameservers_strips_port() -> None:
     resolver._closed = True
     loop.close()
 
-
+#@pytest.mark.asyncio 是 pytest-asyncio 提供的 Marker，讓 pytest 知道這是一個非同步測試。
+#測試框架會負責提供並執行 Event Loop，所以你可以直接在測試函式內使用 await。
+'''
+resolver.query_dns('google.com', 'A'):建立 Future 和 Callback，向 pycares 發起查詢
+await Future:Future 尚未完成時，暫停目前測試 Coroutine
+pycares 回傳 DNS Result:透過 Callback 通知 aiodns
+_callback():呼叫 Future.set_result(result)
+測試 Coroutine 恢復執行:將 DNSResult 指派給 result
+'''
 @pytest.mark.asyncio
 async def test_query_dns() -> None:
     """Test query_dns returns native pycares DNSResult."""
-    resolver = aiodns.DNSResolver(timeout=5.0)
-    resolver.nameservers = ['8.8.8.8']
+    resolver = aiodns.DNSResolver(timeout=5.0) #這裡沒有傳入 loop，因此會使用目前 asyncio 環境提供的 Event Loop。但是舊版是需要透過呼叫setup建立resolver，傳入loop
+    resolver.nameservers = ['8.8.8.8'] #使用真實 DNS Server 的 Integration Test
 
     result = await resolver.query_dns('google.com', 'A')
 
     # Should return pycares.DNSResult
-    assert isinstance(result, pycares.DNSResult)
+    assert isinstance(result, pycares.DNSResult) #query_dns() 回傳的結果是原生 pycares.DNSResult
     assert hasattr(result, 'answer')
     assert hasattr(result, 'authority')
     assert hasattr(result, 'additional')
 
     # Answer should contain DNSRecord objects
-    assert len(result.answer) > 0
+    assert len(result.answer) > 0 #確認 answer 至少有一筆 DNS Record。
     record = result.answer[0]
-    assert hasattr(record, 'type')
-    assert hasattr(record, 'ttl')
-    assert hasattr(record, 'data')
-    assert record.type == pycares.QUERY_TYPE_A
+    assert hasattr(record, 'type') #dns record type: ex: A
+    assert hasattr(record, 'ttl') #time to live
+    assert hasattr(record, 'data') #dns record 的實際資料
+    assert record.type == pycares.QUERY_TYPE_A #result = await resolver.query_dns('google.com', 'A')
 
     await resolver.close()
 
@@ -1194,24 +1300,25 @@ def test_sock_state_cb_and_timer_cb() -> None:
         sock4.close()
         loop.close()
 
-
+#主要驗證：當 Future 已經被取消後，即使 _callback() 收到成功結果或錯誤，也不應再次修改 Future。
 @pytest.mark.asyncio
 async def test_callback_cancelled_future() -> None:
     """Test _callback handles cancelled future."""
     resolver = aiodns.DNSResolver(timeout=5.0)
     fut: asyncio.Future[str] = asyncio.get_event_loop().create_future()
-    fut.cancel()
+    fut.cancel() #這裡只是取消 Future，沒有執行 resolver.cancel()，也沒有任何 DNS 查詢需要取消。
 
     # Directly call _callback with cancelled future - should return early
-    resolver._callback(fut, 'result', None)
-
+    #理論上因為_callback()有fut.done()，所以會直接return，result不會被寫入future。
+    resolver._callback(fut, 'result', None) #模擬 pycares 已經取得成功結果，現在要通知 aiodns。預期會被忽略
+    #建議加入assert fut.cancelled()
     # Also test with errorno - should still return early
     # Pass empty string as result (ignored when errorno is set)
-    resolver._callback(fut, '', 1)
+    resolver._callback(fut, '', 1) #預期會忽略錯誤
+    #建議加入assert fut.cancelled()
+    resolver._closed = True #不等於await resolver.close()，只是避免在測試結束時觸發清理邏輯。
 
-    resolver._closed = True
-
-
+#新版 Callback 收到錯誤，Future 儲存 DNSError
 @pytest.mark.asyncio
 async def test_callback_error() -> None:
     """Test _callback handles error."""
@@ -1228,7 +1335,7 @@ async def test_callback_error() -> None:
 
     resolver._closed = True
 
-
+#舊版 Callback 收到已取消 Future，直接返回，不修改 Future
 @pytest.mark.asyncio
 async def test_query_callback_cancelled_future() -> None:
     """Test _query_callback handles cancelled future."""
@@ -1244,7 +1351,8 @@ async def test_query_callback_cancelled_future() -> None:
 
     resolver._closed = True
 
-
+#舊版 _query_callback() 有兩種不同的錯誤來源
+#1:舊版 Callback 收到錯誤，直接fut.set_exception -> Future 儲存 DNSError
 @pytest.mark.asyncio
 async def test_query_callback_error() -> None:
     """Test _query_callback handles error."""
@@ -1265,32 +1373,37 @@ async def test_query_callback_error() -> None:
         fut.result()
 
     resolver._closed = True
-
-
+#2:舊版 Callback 收到空的 DNSResult(pycares沒有回報錯誤)，enter convert_result() -> Future 儲存 DNSError
 @pytest.mark.asyncio
 async def test_query_callback_empty_result_raises_enodata() -> None:
     """convert_result raising must route through fut.set_exception."""
     resolver = aiodns.DNSResolver(timeout=5.0)
     fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+    #使用 MagicMock 模擬 DNSResult，MagicMock 是 Python unittest.mock 提供的 Mock 物件，可以模擬其他物件的行為。
+    empty = unittest.mock.MagicMock(spec=pycares.DNSResult)#讓 Mock 參照 pycares.DNSResult 的介面，限制它能使用的屬性名稱。
+    empty.answer = []#建立了一個沒有 Answer Records 的假 DNSResult，用來測試舊版資料轉換的錯誤處理。
 
-    empty = unittest.mock.MagicMock(spec=pycares.DNSResult)
-    empty.answer = []
+    resolver._query_callback(fut, pycares.QUERY_TYPE_PTR, empty, None)#_query_callback() 不會進入直接處理 pycares 錯誤碼的分支，而是嘗試轉換查詢結果。
 
-    resolver._query_callback(fut, pycares.QUERY_TYPE_PTR, empty, None)
-
+    #驗證 Future 儲存正確的 Exception
     with pytest.raises(aiodns.error.DNSError) as exc_info:
         fut.result()
     assert exc_info.value.args[0] == pycares.errno.ARES_ENODATA
 
     resolver._closed = True
 
-
+#當 pycares 在發起 DNS 查詢時同步拋出 AresError，aiodns 應將錯誤儲存在 Future，而不是直接從 query_dns() 或 query() 拋出，造成future無法反應最終結果
+#驗證 _capture_ares_error() 是否能正確處理同步發生的 pycares.AresError。
+#新版舊版共用測試 Helper，驗證不合法 Hostname 的錯誤會透過 Future 傳遞
 async def _assert_malformed_name_routes_through_future(
     fut: asyncio.Future[Any],
-) -> None:
+) -> None: #接收 Future
+    # 驗證 API 回傳的是 Future，而不是直接同步拋出錯誤
     assert isinstance(fut, asyncio.Future)
+    # await Future 時應收到 DNSError
     with pytest.raises(aiodns.error.DNSError) as exc_info:
         await fut
+    # 驗證錯誤碼為不合法 Hostname
     assert exc_info.value.args[0] == aiodns.error.ARES_EBADNAME
 
 
@@ -1303,6 +1416,8 @@ async def test_query_dns_malformed_name_routes_through_future() -> None:
     the internally-created future orphaned with an unretrieved exception.
     """
     async with aiodns.DNSResolver() as resolver:
+        # 新版 query_dns() 應回傳 Future
+        # 不合法 Hostname 的錯誤應透過 await 傳遞
         await _assert_malformed_name_routes_through_future(
             resolver.query_dns('example test.com', 'A')
         )
@@ -1314,6 +1429,8 @@ async def test_query_malformed_name_routes_through_future() -> None:
     async with aiodns.DNSResolver() as resolver:
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', DeprecationWarning)
+
+            # 驗證舊版 API 也能正確處理同步 AresError
             fut = resolver.query('example test.com', 'A')
         await _assert_malformed_name_routes_through_future(fut)
 
@@ -1328,7 +1445,7 @@ def _call_resolver_entry_point(
     assert channel_method == 'gethostbyaddr'
     return resolver.gethostbyaddr('127.0.0.1')
 
-
+#還是在驗證 _capture_ares_error() 能否正確處理同步發生的 pycares.AresError，差別主要在於如何觸發錯誤(這邊是用mock)。
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     'channel_method', ['getaddrinfo', 'getnameinfo', 'gethostbyaddr']
@@ -1346,11 +1463,12 @@ async def test_wrapped_entry_points_route_sync_ares_error(
         exc = pycares.AresError(
             aiodns.error.ARES_EBADNAME, 'Misformatted domain name'
         )
+        #暫時將 resolver._channel.getaddrinfo() 替換成 Mock，並設定每次呼叫這個方法時，直接拋出指定的 AresError。
         with unittest.mock.patch.object(
             resolver._channel, channel_method, side_effect=exc
         ):
-            fut = _call_resolver_entry_point(resolver, channel_method)
-        await _assert_malformed_name_routes_through_future(fut)
+            fut = _call_resolver_entry_point(resolver, channel_method)#Mock 就會立即拋出 AresError。
+        await _assert_malformed_name_routes_through_future(fut)#如果 _capture_ares_error() 正常運作，這時 Future 已經被設定 Exception。
 
 
 @pytest.mark.asyncio
