@@ -1366,6 +1366,65 @@ async def test_capture_ares_error_leaves_done_future_untouched() -> None:
             raise pycares.AresError(
                 aiodns.error.ARES_EBADNAME, 'Misformatted domain name'
             )
+'''
+11/16 新增
+讓 DNSResolver.query_dns() 真的建立多個 Futures，但不要真的發送 DNS 封包，而是攔截 pycares 的 Callback，讓測試自己決定哪筆查詢先完成。
+'''
+import asyncio
+from unittest.mock import Mock, patch
+
+import aiodns
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_concurrent_queries_out_of_order():
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+
+    callbacks = {}
+
+    def fake_query(host, qtype, *, callback, **kwargs):
+        callbacks[host] = callback
+
+    try:
+        with patch.object(resolver, "_channel") as channel:
+            channel.query.side_effect = fake_query
+
+            # A -> B -> C 提交
+            future_a = resolver.query_dns("a.example", "A")
+            future_b = resolver.query_dns("b.example", "A")
+            future_c = resolver.query_dns("c.example", "A")
+
+            assert len(callbacks) == 3
+            assert not future_a.done()
+            assert not future_b.done()
+            assert not future_c.done()
+
+            result_a = Mock(name="result_a")
+            result_b = Mock(name="result_b")
+            result_c = Mock(name="result_c")
+
+            # C 最先完成
+            callbacks["c.example"](result_c, None)
+            await asyncio.sleep(0)
+
+            assert future_c.done()
+            assert not future_a.done()
+            assert not future_b.done()
+
+            # 接著 A、B 完成
+            callbacks["a.example"](result_a, None)
+            callbacks["b.example"](result_b, None)
+
+            results = await asyncio.gather(
+                future_a, future_b, future_c
+            )
+
+            assert results == [result_a, result_b, result_c]
+
+    finally:
+        await resolver.close()
 
 
 if __name__ == '__main__':  # pragma: no cover
