@@ -1426,6 +1426,82 @@ async def test_concurrent_queries_out_of_order():
     finally:
         await resolver.close()
 
+'''
+Failure Isolation（錯誤隔離）：當多筆 DNS Queries 同時進行，其中一筆失敗時，其他查詢仍然應該可以正常完成。
+'''
+@pytest.mark.asyncio
+async def test_concurrent_queries_mixed_results():
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+
+    callbacks = {}
+
+    def fake_query(host, qtype, *, callback, **kwargs):
+        #callbacks["a.example"] = callback_a
+        callbacks[host] = callback
+
+    try:
+        with patch.object(resolver, "_channel") as channel: #原本resolver.channel是真正的pycares.Channel，這裡用patch把它換成mock物件，然後把query方法的side_effect設成fake_query，這樣當resolver.query_dns()被呼叫時，就不會真的發送DNS封包，而是會呼叫fake_query，並把callback存到callbacks字典中。
+            channel.query.side_effect = fake_query
+
+            # Submit A -> B -> C
+            #當 query_dns() 執行：self._channel.query(host, qtype_int, callback=cb)，實際呼叫到的是：channel.query 這個 Mock 方法。
+            future_a = resolver.query_dns("a.example", "A")
+            future_b = resolver.query_dns("b.example", "A")
+            future_c = resolver.query_dns("c.example", "A")
+
+            # All queries should initially remain pending
+            assert len(callbacks) == 3
+            assert not future_a.done()
+            assert not future_b.done()
+            assert not future_c.done()
+
+            result_a = Mock(name="result_a")
+            result_c = Mock(name="result_c")
+            
+            # callbacks["..example"] = callback_..
+            # Callback C: success
+            # callback_c(result_c, None)，模擬 pycares 告訴 aiodns： result_c：Query C 成功取得的結果。 None：沒有發生 DNS Error。
+            callbacks["c.example"](result_c, None)
+            await asyncio.sleep(0)
+
+            assert future_c.done()
+            assert not future_a.done()
+            assert not future_b.done()
+
+            # Callback B: DNS error
+            callbacks["b.example"](
+                None, aiodns.error.ARES_ENOTFOUND
+            )
+            await asyncio.sleep(0)
+
+            assert future_b.done()
+            assert not future_a.done()
+            assert future_c.done()
+
+            # Callback A: success
+            callbacks["a.example"](result_a, None)
+
+            # Collect both successful results and exceptions
+            results = await asyncio.gather(
+                future_a, future_b, future_c,
+                return_exceptions=True
+            )
+
+            assert results[0] is result_a
+            assert isinstance(results[1], aiodns.error.DNSError)
+            assert results[1].args[0] == aiodns.error.ARES_ENOTFOUND
+            assert results[2] is result_c
+
+            assert all(
+                fut.done()
+                for fut in (future_a, future_b, future_c)
+            )
+
+    finally:
+        await resolver.close()
+
+
 
 if __name__ == '__main__':  # pragma: no cover
     unittest.main(verbosity=2)
