@@ -1506,6 +1506,72 @@ async def test_concurrent_queries_mixed_results():
         await resolver.close()
 
 
+@pytest.mark.asyncio
+async def test_concurrent_queries_mixed_types():
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+
+    callbacks = {}
+    query_types = {}
+
+    def fake_query(host, qtype, *, callback, **kwargs):
+        callbacks[host] = callback
+        query_types[host] = qtype
+
+    try:
+        with patch.object(resolver, "_channel") as channel:
+            channel.query.side_effect = fake_query
+
+            # Submit queries with different DNS record types
+            future_a = resolver.query_dns("a.example", "A")
+            future_b = resolver.query_dns("b.example", "AAAA")
+            future_c = resolver.query_dns("c.example", "TXT")
+
+            # Verify all three queries are pending
+            assert len(callbacks) == 3
+            assert not future_a.done()
+            assert not future_b.done()
+            assert not future_c.done()
+
+            # Verify query type mapping
+            assert query_types["a.example"] == pycares.QUERY_TYPE_A
+            assert query_types["b.example"] == pycares.QUERY_TYPE_AAAA
+            assert query_types["c.example"] == pycares.QUERY_TYPE_TXT
+
+            # Simulated results for different record types
+            result_a = Mock(name="result_a")
+            result_b = Mock(name="result_aaaa")
+            result_c = Mock(name="result_txt")
+
+            # Complete callbacks out of order: C -> A -> B
+            callbacks["c.example"](result_c, None)
+            await asyncio.sleep(0)
+
+            assert future_c.done()
+            assert not future_a.done()
+            assert not future_b.done()
+
+            callbacks["a.example"](result_a, None)
+            await asyncio.sleep(0)
+
+            assert future_a.done()
+            assert not future_b.done()
+
+            callbacks["b.example"](result_b, None)
+
+            # Collect results in original submission order
+            results = await asyncio.gather(
+                future_a, future_b, future_c
+            )
+
+            assert results[0] is result_a
+            assert results[1] is result_b
+            assert results[2] is result_c
+
+    finally:
+        await resolver.close()
+
+
 
 if __name__ == '__main__':  # pragma: no cover
     unittest.main(verbosity=2)
