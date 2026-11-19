@@ -1476,8 +1476,12 @@ async def test_concurrent_queries_mixed_results():
             await asyncio.sleep(0)
 
             assert future_b.done()
+            assert isinstance(future_b.exception(), aiodns.error.DNSError)
+            assert future_b.exception().args[0] == aiodns.error.ARES_ENOTFOUND
+
             assert not future_a.done()
             assert future_c.done()
+            assert not future_c.cancelled()
 
             # Callback A: success
             callbacks["a.example"](result_a, None)
