@@ -1,5 +1,5 @@
 # command
-- mutmut run "*ǁ_callback__mutmut_*"
+- mutmut run "*ǁ_callback__mutmut_*" --max-children 1
 # `_callback()` Mutation Testing Summary
 
 ## 1. Objective

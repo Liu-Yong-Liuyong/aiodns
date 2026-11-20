@@ -1,5 +1,5 @@
 # command
-- mutmut run "*query_dns*"
+- mutmut run "*query_dns*" --max-children 1
 # query_dns Mutation Testing
 
 - Tool: mutmut 3.8.1

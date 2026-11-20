@@ -1,5 +1,5 @@
 # command
-- mutmut run "*ǁ_get_future_callback__mutmut_*"
+- mutmut run "*ǁ_get_future_callback__mutmut_*" --max-children 1
 
 # `_get_future_callback()` Mutation Testing Summary
 
