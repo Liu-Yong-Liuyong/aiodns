@@ -1,0 +1,4 @@
+    aiodns.xǁDNSResolverǁquery_dns__mutmut_2: survived
+    aiodns.xǁDNSResolverǁquery_dns__mutmut_5: survived
+    aiodns.xǁDNSResolverǁquery_dns__mutmut_6: survived
+    aiodns.xǁDNSResolverǁquery_dns__mutmut_16: survived

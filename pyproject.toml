@@ -48,3 +48,17 @@ include = ["aiodns*"]
 
 [project.urls]
     repository = "https://github.com/aio-libs/aiodns.git"
+
+[tool.mutmut]
+source_paths = ["aiodns"]
+pytest_add_cli_args_test_selection = [
+    "tests/",
+    "-k",
+    "not test_query_a_bad and not test_concurrent_queries",
+]
+on_dependency_change = "rerun"
+process_isolation = "forkserver"
+pytest_add_cli_args = [
+    "-p",
+    "no:unraisableexception",
+]

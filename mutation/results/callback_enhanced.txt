@@ -1,0 +1,2 @@
+    aiodns.xǁDNSResolverǁ_callback__mutmut_4: survived
+    aiodns.xǁDNSResolverǁ_callback__mutmut_6: survived

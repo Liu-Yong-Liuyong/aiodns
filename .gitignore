@@ -19,3 +19,10 @@ __pycache__/
 deps/
 docs/_build/
 .mypy_cache/
+
+# Mutation testing generated files
+/mutants/
+
+# Coverage generated files
+.coverage
+.coverage.*
