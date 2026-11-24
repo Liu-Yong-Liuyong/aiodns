@@ -1312,6 +1312,47 @@ async def test_query_callback_empty_result_raises_enodata() -> None:
     resolver._closed = True
 
 
+@pytest.mark.asyncio
+async def test_query_callback_done_future() -> None:
+    """Test _query_callback ignores further callbacks once the future is
+    done."""
+    resolver = aiodns.DNSResolver(timeout=5.0)
+    loop = asyncio.get_event_loop()
+
+    record = unittest.mock.MagicMock()
+    record.type = pycares.QUERY_TYPE_A
+    record.ttl = 300
+    record.data.addr = '192.0.2.1'
+    dns_result = unittest.mock.MagicMock(spec=pycares.DNSResult)
+    dns_result.answer = [record]
+
+    # First callback succeeds; a later error must not overwrite the result
+    fut: asyncio.Future[Any] = loop.create_future()
+    resolver._query_callback(fut, pycares.QUERY_TYPE_A, dns_result, None)
+    resolver._query_callback(
+        fut,
+        pycares.QUERY_TYPE_A,
+        cast(pycares.DNSResult, None),
+        pycares.errno.ARES_ENOTFOUND,
+    )
+    assert fut.result() == [AresQueryAResult(host='192.0.2.1', ttl=300)]
+
+    # First callback fails; a later result must not replace the error
+    err_fut: asyncio.Future[Any] = loop.create_future()
+    resolver._query_callback(
+        err_fut,
+        pycares.QUERY_TYPE_A,
+        cast(pycares.DNSResult, None),
+        pycares.errno.ARES_ENOTFOUND,
+    )
+    resolver._query_callback(err_fut, pycares.QUERY_TYPE_A, dns_result, None)
+    with pytest.raises(aiodns.error.DNSError) as exc_info:
+        err_fut.result()
+    assert exc_info.value.args[0] == pycares.errno.ARES_ENOTFOUND
+
+    resolver._closed = True
+
+
 async def _assert_malformed_name_routes_through_future(
     fut: asyncio.Future[Any],
 ) -> None:
