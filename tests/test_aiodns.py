@@ -818,6 +818,42 @@ async def test_gethostbyname_cancelled_future() -> None:
     await resolver.close()
 
 
+@pytest.mark.asyncio
+async def test_gethostbyname_callback_done_future() -> None:
+    """Test _gethostbyname_callback ignores further callbacks once the
+    future is done."""
+    resolver = aiodns.DNSResolver(timeout=5.0)
+    loop = asyncio.get_event_loop()
+
+    node = unittest.mock.MagicMock()
+    node.addr = (b'192.0.2.1', 0)
+    addrinfo = unittest.mock.MagicMock(spec=pycares.AddrInfoResult)
+    addrinfo.nodes = [node]
+    addrinfo.cnames = []
+
+    # First callback succeeds; a later error must not overwrite the result
+    fut: asyncio.Future[AresHostResult] = loop.create_future()
+    resolver._gethostbyname_callback(fut, 'example.com', addrinfo, None)
+    resolver._gethostbyname_callback(
+        fut, 'example.com', None, pycares.errno.ARES_ENOTFOUND
+    )
+    assert fut.result() == AresHostResult(
+        name='example.com', aliases=[], addresses=['192.0.2.1']
+    )
+
+    # First callback fails; a later result must not replace the error
+    err_fut: asyncio.Future[AresHostResult] = loop.create_future()
+    resolver._gethostbyname_callback(
+        err_fut, 'example.com', None, pycares.errno.ARES_ENOTFOUND
+    )
+    resolver._gethostbyname_callback(err_fut, 'example.com', addrinfo, None)
+    with pytest.raises(aiodns.error.DNSError) as exc_info:
+        err_fut.result()
+    assert exc_info.value.args[0] == pycares.errno.ARES_ENOTFOUND
+
+    await resolver.close()
+
+
 def test_gethostbyname_with_sock_state_cb_fallback() -> None:
     """Test gethostbyname works with sock_state_cb fallback path."""
     loop = asyncio.SelectorEventLoop()
