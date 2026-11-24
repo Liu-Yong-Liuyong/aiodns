@@ -1231,6 +1231,32 @@ async def test_callback_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_callback_done_future() -> None:
+    """Test _callback ignores further callbacks once the future is done."""
+    resolver = aiodns.DNSResolver(timeout=5.0)
+    loop = asyncio.get_event_loop()
+
+    # First callback succeeds; a second result or an error must not
+    # overwrite it (set_result() on a done future would raise
+    # InvalidStateError)
+    fut: asyncio.Future[str] = loop.create_future()
+    resolver._callback(fut, 'first', None)
+    resolver._callback(fut, 'second', None)
+    resolver._callback(fut, '', pycares.errno.ARES_ENOTFOUND)
+    assert fut.result() == 'first'
+
+    # First callback fails; a later result must not replace the error
+    err_fut: asyncio.Future[str] = loop.create_future()
+    resolver._callback(err_fut, '', pycares.errno.ARES_ENOTFOUND)
+    resolver._callback(err_fut, 'second', None)
+    with pytest.raises(aiodns.error.DNSError) as exc_info:
+        err_fut.result()
+    assert exc_info.value.args[0] == pycares.errno.ARES_ENOTFOUND
+
+    resolver._closed = True
+
+
+@pytest.mark.asyncio
 async def test_query_callback_cancelled_future() -> None:
     """Test _query_callback handles cancelled future."""
     resolver = aiodns.DNSResolver(timeout=5.0)
