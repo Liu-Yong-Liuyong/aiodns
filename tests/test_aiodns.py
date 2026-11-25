@@ -1726,5 +1726,60 @@ async def test_resolver_cancel_pending_queries() -> None:
         await resolver.close()
 
 
+@pytest.mark.asyncio
+async def test_cancel_between_callback_scheduling_and_execution() -> None:
+    """Cancellation wins over a callback that is scheduled but not run yet.
+
+    In event thread mode pycares delivers the reply through
+    loop.call_soon_threadsafe, so the future can be cancelled after the
+    callback was scheduled and before the event loop runs it.
+    """
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+    # The race only exists when callbacks are scheduled on the loop
+    resolver._event_thread = True
+
+    callbacks = {}
+    loop_errors: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, ctx: loop_errors.append(ctx))
+
+    def fake_query(
+        host: str,
+        qtype: int,
+        *,
+        callback: Callable[..., None],
+        **kwargs: Any,
+    ) -> None:
+        callbacks[host] = callback
+
+    try:
+        with patch.object(resolver, '_channel') as channel:
+            channel.query.side_effect = fake_query
+
+            future_a = resolver.query_dns('a.example', 'A')
+            future_b = resolver.query_dns('b.example', 'A')
+
+            # Both replies arrive, but the callbacks are only scheduled
+            callbacks['a.example'](Mock(name='result_a'), None)
+            callbacks['b.example'](None, aiodns.error.ARES_ENOTFOUND)
+            assert not future_a.done()
+            assert not future_b.done()
+
+            # Cancel both futures before the event loop runs the callbacks
+            assert future_a.cancel()
+            assert future_b.cancel()
+            await asyncio.sleep(0)
+
+            assert future_a.cancelled()
+            assert future_b.cancelled()
+            # An InvalidStateError raised inside a scheduled callback is
+            # only reported to the loop exception handler
+            assert loop_errors == []
+
+    finally:
+        loop.set_exception_handler(None)
+        await resolver.close()
+
+
 if __name__ == '__main__':  # pragma: no cover
     unittest.main(verbosity=2)
