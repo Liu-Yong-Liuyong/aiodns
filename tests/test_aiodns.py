@@ -1841,5 +1841,54 @@ async def test_partial_future_cancellation() -> None:
         await resolver.close()
 
 
+@pytest.mark.asyncio
+async def test_sync_ares_error_after_scheduled_callback() -> None:
+    """The same error arrives through the callback and as a raised error.
+
+    In event thread mode the callback is only scheduled, so
+    _capture_ares_error sets the exception first and the scheduled
+    callback must then leave the done future alone.
+    """
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+    # The callback has to be scheduled for this ordering to happen
+    resolver._event_thread = True
+
+    loop_errors: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, ctx: loop_errors.append(ctx))
+
+    def fake_query(
+        host: str,
+        qtype: int,
+        *,
+        callback: Callable[..., None],
+        **kwargs: Any,
+    ) -> None:
+        callback(None, aiodns.error.ARES_EBADNAME)
+        raise pycares.AresError(
+            aiodns.error.ARES_EBADNAME, 'Misformatted domain name'
+        )
+
+    try:
+        with patch.object(resolver, '_channel') as channel:
+            channel.query.side_effect = fake_query
+
+            future = resolver.query_dns('example test.com', 'A')
+            # Already set by _capture_ares_error
+            assert future.done()
+
+            # Run the scheduled callback for the same error
+            await asyncio.sleep(0)
+
+            with pytest.raises(aiodns.error.DNSError) as exc_info:
+                await future
+            assert exc_info.value.args[0] == aiodns.error.ARES_EBADNAME
+            assert loop_errors == []
+
+    finally:
+        loop.set_exception_handler(None)
+        await resolver.close()
+
+
 if __name__ == '__main__':  # pragma: no cover
     unittest.main(verbosity=2)
