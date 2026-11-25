@@ -10,12 +10,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from typing import Any
+from unittest.mock import Mock
 
 import pycares
 import pytest
 
 import aiodns
-from aiodns.error import ARES_ECANCELLED, DNSError
+from aiodns.error import ARES_ECANCELLED, ARES_ENOTFOUND, DNSError
 
 Resolver = tuple[aiodns.DNSResolver, 'FakeChannel']
 
@@ -143,3 +144,58 @@ async def test_lifecycle_close_without_pending_queries(
 
     assert fake.calls == ['cancel', 'close']
     assert resolver._closed
+
+
+async def test_lifecycle_close_with_mixed_query_states(
+    resolver_and_fake: Resolver, loop_errors: list[dict[str, object]]
+) -> None:
+    """close() only touches queries that are still pending.
+
+    a: finished with a result, b: finished with an error,
+    c: cancelled by the caller, d: still pending.
+    """
+    resolver, fake = resolver_and_fake
+    fut_a = resolver.query_dns('a.example', 'A')
+    fut_b = resolver.query_dns('b.example', 'A')
+    fut_c = resolver.query_dns('c.example', 'A')
+    fut_d = resolver.query_dns('d.example', 'A')
+
+    result_a = Mock(name='result_a')
+    fake.complete('a.example', result_a)
+    fake.fail('b.example', ARES_ENOTFOUND)
+    await run_pending_callbacks()
+    # c-ares does not know about this; c stays pending in the channel.
+    fut_c.cancel()
+
+    await resolver.close()
+    await run_pending_callbacks()
+
+    assert fut_a.result() is result_a
+    exc_b = fut_b.exception()
+    assert isinstance(exc_b, DNSError)
+    assert exc_b.args[0] == ARES_ENOTFOUND
+    assert fut_c.cancelled()
+    assert_cancelled_by_resolver(fut_d)
+    # Setting a result on the cancelled future would raise
+    # InvalidStateError inside a loop callback.
+    assert loop_errors == []
+
+
+async def test_lifecycle_result_arrives_just_before_close(
+    resolver_and_fake: Resolver, loop_errors: list[dict[str, object]]
+) -> None:
+    """A result already delivered by c-ares is kept, not replaced."""
+    resolver, fake = resolver_and_fake
+    fut_a = resolver.query_dns('a.example', 'A')
+    fut_b = resolver.query_dns('b.example', 'A')
+
+    result_a = Mock(name='result_a')
+    # In event thread mode this only schedules the callback; close()
+    # runs before the event loop gets to it.
+    fake.complete('a.example', result_a)
+    await resolver.close()
+    await run_pending_callbacks()
+
+    assert fut_a.result() is result_a
+    assert_cancelled_by_resolver(fut_b)
+    assert loop_errors == []
