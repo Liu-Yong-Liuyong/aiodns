@@ -1670,5 +1670,61 @@ async def test_concurrent_queries_mixed_types() -> None:
         await resolver.close()
 
 
+@pytest.mark.asyncio
+async def test_resolver_cancel_pending_queries() -> None:
+    """resolver.cancel() fails every pending query with ARES_ECANCELLED.
+
+    Unlike test_query_cancel this does not depend on the network, and it
+    also checks that the resolver can still be used after cancel().
+    """
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+
+    callbacks = {}
+
+    def fake_query(
+        host: str,
+        qtype: int,
+        *,
+        callback: Callable[..., None],
+        **kwargs: Any,
+    ) -> None:
+        callbacks[host] = callback
+
+    def fake_cancel() -> None:
+        # Like c-ares: every pending query gets ARES_ECANCELLED
+        pending = list(callbacks.values())
+        callbacks.clear()
+        for callback in pending:
+            callback(None, aiodns.error.ARES_ECANCELLED)
+
+    try:
+        with patch.object(resolver, '_channel') as channel:
+            channel.query.side_effect = fake_query
+            channel.cancel.side_effect = fake_cancel
+
+            futures = [
+                resolver.query_dns(f'{name}.example', 'A')
+                for name in ('a', 'b', 'c')
+            ]
+
+            resolver.cancel()
+            channel.cancel.assert_called_once_with()
+
+            results = await asyncio.gather(*futures, return_exceptions=True)
+            for result in results:
+                assert isinstance(result, aiodns.error.DNSError)
+                assert result.args[0] == aiodns.error.ARES_ECANCELLED
+
+            # The resolver still works after cancel()
+            future_d = resolver.query_dns('d.example', 'A')
+            result_d = Mock(name='result_d')
+            callbacks['d.example'](result_d, None)
+            assert await future_d is result_d
+
+    finally:
+        await resolver.close()
+
+
 if __name__ == '__main__':  # pragma: no cover
     unittest.main(verbosity=2)
