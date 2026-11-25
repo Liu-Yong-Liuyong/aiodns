@@ -104,3 +104,42 @@ def assert_cancelled_by_resolver(fut: asyncio.Future[Any]) -> None:
         ARES_ECANCELLED,
         pycares.errno.strerror(ARES_ECANCELLED),
     )
+
+
+@pytest.mark.parametrize('count', [1, 3, 100])
+async def test_lifecycle_close_cancels_all_pending_queries(
+    resolver_and_fake: Resolver, count: int
+) -> None:
+    """Every pending query ends with ARES_ECANCELLED after close()."""
+    resolver, fake = resolver_and_fake
+    futures = [
+        resolver.query_dns(f'host{i}.example', 'A') for i in range(count)
+    ]
+    assert len(fake.pending) == count
+    assert not any(fut.done() for fut in futures)
+
+    await resolver.close()
+    await run_pending_callbacks()
+
+    for fut in futures:
+        assert fut.done()
+        assert_cancelled_by_resolver(fut)
+    assert fake.pending == {}
+    # Pending queries are cancelled before the channel is destroyed.
+    assert fake.calls == ['cancel', 'close']
+    assert resolver._closed
+    assert resolver._timer is None
+    assert not resolver._read_fds
+    assert not resolver._write_fds
+
+
+async def test_lifecycle_close_without_pending_queries(
+    resolver_and_fake: Resolver,
+) -> None:
+    """Boundary case: closing an idle resolver still releases it."""
+    resolver, fake = resolver_and_fake
+
+    await resolver.close()
+
+    assert fake.calls == ['cancel', 'close']
+    assert resolver._closed
