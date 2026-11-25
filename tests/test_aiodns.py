@@ -1890,5 +1890,51 @@ async def test_sync_ares_error_after_scheduled_callback() -> None:
         await resolver.close()
 
 
+@pytest.mark.asyncio
+async def test_wait_for_timeout_then_late_reply() -> None:
+    """asyncio.wait_for() cancels the future on timeout, not the query.
+
+    The query stays pending in the channel and its late reply is ignored.
+    """
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+
+    callbacks = {}
+    loop_errors: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, ctx: loop_errors.append(ctx))
+
+    def fake_query(
+        host: str,
+        qtype: int,
+        *,
+        callback: Callable[..., None],
+        **kwargs: Any,
+    ) -> None:
+        callbacks[host] = callback
+
+    try:
+        with patch.object(resolver, '_channel') as channel:
+            channel.query.side_effect = fake_query
+
+            future = resolver.query_dns('slow.example', 'A')
+
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(future, timeout=0.01)
+            assert future.cancelled()
+            # Cancelling the future does not cancel the query in c-ares
+            channel.cancel.assert_not_called()
+
+            # The reply arrives after the timeout
+            callbacks['slow.example'](Mock(name='late_result'), None)
+            await asyncio.sleep(0)
+
+            assert future.cancelled()
+            assert loop_errors == []
+
+    finally:
+        loop.set_exception_handler(None)
+        await resolver.close()
+
+
 if __name__ == '__main__':  # pragma: no cover
     unittest.main(verbosity=2)
