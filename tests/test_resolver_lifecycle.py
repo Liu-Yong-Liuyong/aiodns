@@ -237,3 +237,45 @@ async def test_lifecycle_context_manager_exit_on_error_cancels_queries(
         assert_cancelled_by_resolver(fut)
     assert fake.calls == ['cancel', 'close']
     assert resolver._closed
+
+
+async def test_lifecycle_query_after_close_raises() -> None:
+    """A closed resolver refuses new queries instead of hanging.
+
+    Uses the real pycares channel; the query fails before anything is
+    sent, so no network is needed.
+    """
+    resolver = aiodns.DNSResolver(nameservers=['192.0.2.1'])
+    await resolver.close()
+
+    with pytest.raises(RuntimeError, match='destroyed'):
+        _ = resolver.query_dns('example.com', 'A')
+
+
+async def test_lifecycle_real_channel_close_ends_pending_queries(
+    loop_errors: list[dict[str, object]],
+) -> None:
+    """Check the same scenario against the real pycares channel.
+
+    192.0.2.1 (TEST-NET-1) never answers, so the queries are usually
+    still pending when close() is called. Depending on the network,
+    c-ares can occasionally fail a query first (for example
+    ARES_ECONNREFUSED) from its own thread, so this test does not
+    require ARES_ECANCELLED. It only checks what must hold either way:
+    no query is left hanging, the cancelled one stays cancelled, and
+    no error is raised inside the event loop.
+    """
+    resolver = aiodns.DNSResolver(nameservers=['192.0.2.1'], timeout=5)
+    fut_a = resolver.query_dns('a.example', 'A')
+    fut_b = resolver.query_dns('b.example', 'A')
+    fut_c = resolver.query_dns('c.example', 'A')
+    fut_c.cancel()
+
+    await resolver.close()
+    await run_pending_callbacks()
+
+    for fut in (fut_a, fut_b):
+        assert fut.done()
+        assert isinstance(fut.exception(), DNSError)
+    assert fut_c.cancelled()
+    assert loop_errors == []
