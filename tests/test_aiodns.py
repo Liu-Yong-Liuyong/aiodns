@@ -1781,5 +1781,65 @@ async def test_cancel_between_callback_scheduling_and_execution() -> None:
         await resolver.close()
 
 
+@pytest.mark.asyncio
+async def test_partial_future_cancellation() -> None:
+    """Cancelling one pending query does not affect the others.
+
+    The reply for the cancelled query arrives last and must be ignored.
+    """
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+
+    callbacks = {}
+    loop_errors: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, ctx: loop_errors.append(ctx))
+
+    def fake_query(
+        host: str,
+        qtype: int,
+        *,
+        callback: Callable[..., None],
+        **kwargs: Any,
+    ) -> None:
+        callbacks[host] = callback
+
+    try:
+        with patch.object(resolver, '_channel') as channel:
+            channel.query.side_effect = fake_query
+
+            future_a = resolver.query_dns('a.example', 'A')
+            future_b = resolver.query_dns('b.example', 'A')
+            future_c = resolver.query_dns('c.example', 'A')
+
+            # Cancel B while all three queries are pending
+            assert future_b.cancel()
+            assert not future_a.done()
+            assert not future_c.done()
+
+            result_a = Mock(name='result_a')
+            result_b = Mock(name='result_b')
+            result_c = Mock(name='result_c')
+
+            # Replies arrive out of order: C -> A -> B (late)
+            callbacks['c.example'](result_c, None)
+            callbacks['a.example'](result_a, None)
+            callbacks['b.example'](result_b, None)
+
+            results = await asyncio.gather(
+                future_a, future_b, future_c, return_exceptions=True
+            )
+            await asyncio.sleep(0)
+
+            assert results[0] is result_a
+            assert isinstance(results[1], asyncio.CancelledError)
+            assert results[2] is result_c
+            assert future_b.cancelled()
+            assert loop_errors == []
+
+    finally:
+        loop.set_exception_handler(None)
+        await resolver.close()
+
+
 if __name__ == '__main__':  # pragma: no cover
     unittest.main(verbosity=2)
