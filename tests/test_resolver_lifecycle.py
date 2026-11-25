@@ -199,3 +199,41 @@ async def test_lifecycle_result_arrives_just_before_close(
     assert fut_a.result() is result_a
     assert_cancelled_by_resolver(fut_b)
     assert loop_errors == []
+
+
+async def test_lifecycle_close_is_idempotent_with_pending_queries(
+    resolver_and_fake: Resolver,
+) -> None:
+    """Repeated close() calls cancel and release resources only once."""
+    resolver, fake = resolver_and_fake
+    futures = [resolver.query_dns(f'host{i}.example', 'A') for i in range(3)]
+
+    await resolver.close()
+    await resolver.close()
+    await resolver.close()
+    await run_pending_callbacks()
+
+    for fut in futures:
+        assert_cancelled_by_resolver(fut)
+    assert fake.calls == ['cancel', 'close']
+
+
+async def test_lifecycle_context_manager_exit_on_error_cancels_queries(
+    resolver_and_fake: Resolver,
+) -> None:
+    """Leaving ``async with`` because of an error closes the resolver."""
+    resolver, fake = resolver_and_fake
+    futures: list[asyncio.Future[Any]] = []
+
+    with pytest.raises(ValueError, match='boom'):
+        async with resolver:
+            futures.append(resolver.query_dns('a.example', 'A'))
+            futures.append(resolver.query_dns('b.example', 'A'))
+            raise ValueError('boom')
+
+    await run_pending_callbacks()
+
+    for fut in futures:
+        assert_cancelled_by_resolver(fut)
+    assert fake.calls == ['cancel', 'close']
+    assert resolver._closed
