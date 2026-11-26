@@ -1,0 +1,39 @@
+COMMON_EXCLUDE="not test_query_a_bad \
+and not test_callback_done_future \
+and not test_query_callback_done_future \
+and not test_gethostbyname_callback_done_future \
+and not test_resolver_cancel_pending_queries \
+and not test_cancel_between_callback_scheduling_and_execution \
+and not test_partial_future_cancellation \
+and not test_sync_ares_error_after_scheduled_callback \
+and not test_wait_for_timeout_then_late_reply"
+
+python -m pytest tests \
+  --ignore=tests/test_resolver_lifecycle.py \
+  -k "$COMMON_EXCLUDE and not test_concurrent_queries" \
+  --collect-only -q
+
+python -m pytest tests \
+  --ignore=tests/test_resolver_lifecycle.py \
+  -k "$COMMON_EXCLUDE and not test_concurrent_queries" \
+  -q
+
+mutmut run --max-children 1 "*query_dns*"
+
+mutmut results | grep 'ǁquery_dns__mutmut_' \
+  > mutation/rerun/baseline/query_dns.txt
+
+mutmut run --max-children 1 "*ǁ_get_future_callback__mutmut_*"
+
+mutmut results | grep 'ǁ_get_future_callback__mutmut_' \
+  > mutation/rerun/baseline/future_callback.txt
+
+mutmut run --max-children 1 "*ǁ_callback__mutmut_*"
+
+mutmut results | grep 'ǁ_callback__mutmut_' \
+  > mutation/rerun/baseline/callback.txt
+
+python -m pytest tests \
+  --ignore=tests/test_resolver_lifecycle.py \
+  -k "not test_query_a_bad and not test_callback_done_future and not test_query_callback_done_future and not test_gethostbyname_callback_done_future and not test_resolver_cancel_pending_queries and not test_cancel_between_callback_scheduling_and_execution and not test_partial_future_cancellation and not test_sync_ares_error_after_scheduled_callback and not test_wait_for_timeout_then_late_reply" \
+  -q
