@@ -818,6 +818,42 @@ async def test_gethostbyname_cancelled_future() -> None:
     await resolver.close()
 
 
+@pytest.mark.asyncio
+async def test_gethostbyname_callback_done_future() -> None:
+    """Test _gethostbyname_callback ignores further callbacks once the
+    future is done."""
+    resolver = aiodns.DNSResolver(timeout=5.0)
+    loop = asyncio.get_event_loop()
+
+    node = unittest.mock.MagicMock()
+    node.addr = (b'192.0.2.1', 0)
+    addrinfo = unittest.mock.MagicMock(spec=pycares.AddrInfoResult)
+    addrinfo.nodes = [node]
+    addrinfo.cnames = []
+
+    # First callback succeeds; a later error must not overwrite the result
+    fut: asyncio.Future[AresHostResult] = loop.create_future()
+    resolver._gethostbyname_callback(fut, 'example.com', addrinfo, None)
+    resolver._gethostbyname_callback(
+        fut, 'example.com', None, pycares.errno.ARES_ENOTFOUND
+    )
+    assert fut.result() == AresHostResult(
+        name='example.com', aliases=[], addresses=['192.0.2.1']
+    )
+
+    # First callback fails; a later result must not replace the error
+    err_fut: asyncio.Future[AresHostResult] = loop.create_future()
+    resolver._gethostbyname_callback(
+        err_fut, 'example.com', None, pycares.errno.ARES_ENOTFOUND
+    )
+    resolver._gethostbyname_callback(err_fut, 'example.com', addrinfo, None)
+    with pytest.raises(aiodns.error.DNSError) as exc_info:
+        err_fut.result()
+    assert exc_info.value.args[0] == pycares.errno.ARES_ENOTFOUND
+
+    await resolver.close()
+
+
 def test_gethostbyname_with_sock_state_cb_fallback() -> None:
     """Test gethostbyname works with sock_state_cb fallback path."""
     loop = asyncio.SelectorEventLoop()
@@ -1231,6 +1267,32 @@ async def test_callback_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_callback_done_future() -> None:
+    """Test _callback ignores further callbacks once the future is done."""
+    resolver = aiodns.DNSResolver(timeout=5.0)
+    loop = asyncio.get_event_loop()
+
+    # First callback succeeds; a second result or an error must not
+    # overwrite it (set_result() on a done future would raise
+    # InvalidStateError)
+    fut: asyncio.Future[str] = loop.create_future()
+    resolver._callback(fut, 'first', None)
+    resolver._callback(fut, 'second', None)
+    resolver._callback(fut, '', pycares.errno.ARES_ENOTFOUND)
+    assert fut.result() == 'first'
+
+    # First callback fails; a later result must not replace the error
+    err_fut: asyncio.Future[str] = loop.create_future()
+    resolver._callback(err_fut, '', pycares.errno.ARES_ENOTFOUND)
+    resolver._callback(err_fut, 'second', None)
+    with pytest.raises(aiodns.error.DNSError) as exc_info:
+        err_fut.result()
+    assert exc_info.value.args[0] == pycares.errno.ARES_ENOTFOUND
+
+    resolver._closed = True
+
+
+@pytest.mark.asyncio
 async def test_query_callback_cancelled_future() -> None:
     """Test _query_callback handles cancelled future."""
     resolver = aiodns.DNSResolver(timeout=5.0)
@@ -1282,6 +1344,47 @@ async def test_query_callback_empty_result_raises_enodata() -> None:
     with pytest.raises(aiodns.error.DNSError) as exc_info:
         fut.result()
     assert exc_info.value.args[0] == pycares.errno.ARES_ENODATA
+
+    resolver._closed = True
+
+
+@pytest.mark.asyncio
+async def test_query_callback_done_future() -> None:
+    """Test _query_callback ignores further callbacks once the future is
+    done."""
+    resolver = aiodns.DNSResolver(timeout=5.0)
+    loop = asyncio.get_event_loop()
+
+    record = unittest.mock.MagicMock()
+    record.type = pycares.QUERY_TYPE_A
+    record.ttl = 300
+    record.data.addr = '192.0.2.1'
+    dns_result = unittest.mock.MagicMock(spec=pycares.DNSResult)
+    dns_result.answer = [record]
+
+    # First callback succeeds; a later error must not overwrite the result
+    fut: asyncio.Future[Any] = loop.create_future()
+    resolver._query_callback(fut, pycares.QUERY_TYPE_A, dns_result, None)
+    resolver._query_callback(
+        fut,
+        pycares.QUERY_TYPE_A,
+        cast(pycares.DNSResult, None),
+        pycares.errno.ARES_ENOTFOUND,
+    )
+    assert fut.result() == [AresQueryAResult(host='192.0.2.1', ttl=300)]
+
+    # First callback fails; a later result must not replace the error
+    err_fut: asyncio.Future[Any] = loop.create_future()
+    resolver._query_callback(
+        err_fut,
+        pycares.QUERY_TYPE_A,
+        cast(pycares.DNSResult, None),
+        pycares.errno.ARES_ENOTFOUND,
+    )
+    resolver._query_callback(err_fut, pycares.QUERY_TYPE_A, dns_result, None)
+    with pytest.raises(aiodns.error.DNSError) as exc_info:
+        err_fut.result()
+    assert exc_info.value.args[0] == pycares.errno.ARES_ENOTFOUND
 
     resolver._closed = True
 
@@ -1564,6 +1667,272 @@ async def test_concurrent_queries_mixed_types() -> None:
             assert results[2] is result_c
 
     finally:
+        await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_resolver_cancel_pending_queries() -> None:
+    """resolver.cancel() fails every pending query with ARES_ECANCELLED.
+
+    Unlike test_query_cancel this does not depend on the network, and it
+    also checks that the resolver can still be used after cancel().
+    """
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+
+    callbacks = {}
+
+    def fake_query(
+        host: str,
+        qtype: int,
+        *,
+        callback: Callable[..., None],
+        **kwargs: Any,
+    ) -> None:
+        callbacks[host] = callback
+
+    def fake_cancel() -> None:
+        # Like c-ares: every pending query gets ARES_ECANCELLED
+        pending = list(callbacks.values())
+        callbacks.clear()
+        for callback in pending:
+            callback(None, aiodns.error.ARES_ECANCELLED)
+
+    try:
+        with patch.object(resolver, '_channel') as channel:
+            channel.query.side_effect = fake_query
+            channel.cancel.side_effect = fake_cancel
+
+            futures = [
+                resolver.query_dns(f'{name}.example', 'A')
+                for name in ('a', 'b', 'c')
+            ]
+
+            resolver.cancel()
+            channel.cancel.assert_called_once_with()
+
+            results = await asyncio.gather(*futures, return_exceptions=True)
+            for result in results:
+                assert isinstance(result, aiodns.error.DNSError)
+                assert result.args[0] == aiodns.error.ARES_ECANCELLED
+
+            # The resolver still works after cancel()
+            future_d = resolver.query_dns('d.example', 'A')
+            result_d = Mock(name='result_d')
+            callbacks['d.example'](result_d, None)
+            assert await future_d is result_d
+
+    finally:
+        await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_between_callback_scheduling_and_execution() -> None:
+    """Cancellation wins over a callback that is scheduled but not run yet.
+
+    In event thread mode pycares delivers the reply through
+    loop.call_soon_threadsafe, so the future can be cancelled after the
+    callback was scheduled and before the event loop runs it.
+    """
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+    # The race only exists when callbacks are scheduled on the loop
+    resolver._event_thread = True
+
+    callbacks = {}
+    loop_errors: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, ctx: loop_errors.append(ctx))
+
+    def fake_query(
+        host: str,
+        qtype: int,
+        *,
+        callback: Callable[..., None],
+        **kwargs: Any,
+    ) -> None:
+        callbacks[host] = callback
+
+    try:
+        with patch.object(resolver, '_channel') as channel:
+            channel.query.side_effect = fake_query
+
+            future_a = resolver.query_dns('a.example', 'A')
+            future_b = resolver.query_dns('b.example', 'A')
+
+            # Both replies arrive, but the callbacks are only scheduled
+            callbacks['a.example'](Mock(name='result_a'), None)
+            callbacks['b.example'](None, aiodns.error.ARES_ENOTFOUND)
+            assert not future_a.done()
+            assert not future_b.done()
+
+            # Cancel both futures before the event loop runs the callbacks
+            assert future_a.cancel()
+            assert future_b.cancel()
+            await asyncio.sleep(0)
+
+            assert future_a.cancelled()
+            assert future_b.cancelled()
+            # An InvalidStateError raised inside a scheduled callback is
+            # only reported to the loop exception handler
+            assert loop_errors == []
+
+    finally:
+        loop.set_exception_handler(None)
+        await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_future_cancellation() -> None:
+    """Cancelling one pending query does not affect the others.
+
+    The reply for the cancelled query arrives last and must be ignored.
+    """
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+
+    callbacks = {}
+    loop_errors: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, ctx: loop_errors.append(ctx))
+
+    def fake_query(
+        host: str,
+        qtype: int,
+        *,
+        callback: Callable[..., None],
+        **kwargs: Any,
+    ) -> None:
+        callbacks[host] = callback
+
+    try:
+        with patch.object(resolver, '_channel') as channel:
+            channel.query.side_effect = fake_query
+
+            future_a = resolver.query_dns('a.example', 'A')
+            future_b = resolver.query_dns('b.example', 'A')
+            future_c = resolver.query_dns('c.example', 'A')
+
+            # Cancel B while all three queries are pending
+            assert future_b.cancel()
+            assert not future_a.done()
+            assert not future_c.done()
+
+            result_a = Mock(name='result_a')
+            result_b = Mock(name='result_b')
+            result_c = Mock(name='result_c')
+
+            # Replies arrive out of order: C -> A -> B (late)
+            callbacks['c.example'](result_c, None)
+            callbacks['a.example'](result_a, None)
+            callbacks['b.example'](result_b, None)
+
+            results = await asyncio.gather(
+                future_a, future_b, future_c, return_exceptions=True
+            )
+            await asyncio.sleep(0)
+
+            assert results[0] is result_a
+            assert isinstance(results[1], asyncio.CancelledError)
+            assert results[2] is result_c
+            assert future_b.cancelled()
+            assert loop_errors == []
+
+    finally:
+        loop.set_exception_handler(None)
+        await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_ares_error_after_scheduled_callback() -> None:
+    """The same error arrives through the callback and as a raised error.
+
+    In event thread mode the callback is only scheduled, so
+    _capture_ares_error sets the exception first and the scheduled
+    callback must then leave the done future alone.
+    """
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+    # The callback has to be scheduled for this ordering to happen
+    resolver._event_thread = True
+
+    loop_errors: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, ctx: loop_errors.append(ctx))
+
+    def fake_query(
+        host: str,
+        qtype: int,
+        *,
+        callback: Callable[..., None],
+        **kwargs: Any,
+    ) -> None:
+        callback(None, aiodns.error.ARES_EBADNAME)
+        raise pycares.AresError(
+            aiodns.error.ARES_EBADNAME, 'Misformatted domain name'
+        )
+
+    try:
+        with patch.object(resolver, '_channel') as channel:
+            channel.query.side_effect = fake_query
+
+            future = resolver.query_dns('example test.com', 'A')
+            # Already set by _capture_ares_error
+            assert future.done()
+
+            # Run the scheduled callback for the same error
+            await asyncio.sleep(0)
+
+            with pytest.raises(aiodns.error.DNSError) as exc_info:
+                await future
+            assert exc_info.value.args[0] == aiodns.error.ARES_EBADNAME
+            assert loop_errors == []
+
+    finally:
+        loop.set_exception_handler(None)
+        await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_timeout_then_late_reply() -> None:
+    """asyncio.wait_for() cancels the future on timeout, not the query.
+
+    The query stays pending in the channel and its late reply is ignored.
+    """
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+
+    callbacks = {}
+    loop_errors: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, ctx: loop_errors.append(ctx))
+
+    def fake_query(
+        host: str,
+        qtype: int,
+        *,
+        callback: Callable[..., None],
+        **kwargs: Any,
+    ) -> None:
+        callbacks[host] = callback
+
+    try:
+        with patch.object(resolver, '_channel') as channel:
+            channel.query.side_effect = fake_query
+
+            future = resolver.query_dns('slow.example', 'A')
+
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(future, timeout=0.01)
+            assert future.cancelled()
+            # Cancelling the future does not cancel the query in c-ares
+            channel.cancel.assert_not_called()
+
+            # The reply arrives after the timeout
+            callbacks['slow.example'](Mock(name='late_result'), None)
+            await asyncio.sleep(0)
+
+            assert future.cancelled()
+            assert loop_errors == []
+
+    finally:
+        loop.set_exception_handler(None)
         await resolver.close()
 
 
