@@ -22,6 +22,7 @@ docs/_build/
 
 # Mutation testing generated files
 /mutants/
+/mutants_before_rerun/
 
 # Coverage generated files
 .coverage

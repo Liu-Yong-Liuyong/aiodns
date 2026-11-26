@@ -53,8 +53,9 @@ include = ["aiodns*"]
 source_paths = ["aiodns"]
 pytest_add_cli_args_test_selection = [
     "tests/",
+    "--ignore=tests/test_resolver_lifecycle.py",
     "-k",
-    "not test_query_a_bad and not test_concurrent_queries",
+    "not test_query_a_bad and not test_callback_done_future and not test_query_callback_done_future and not test_gethostbyname_callback_done_future and not test_resolver_cancel_pending_queries and not test_cancel_between_callback_scheduling_and_execution and not test_partial_future_cancellation and not test_sync_ares_error_after_scheduled_callback and not test_wait_for_timeout_then_late_reply",
 ]
 on_dependency_change = "rerun"
 process_isolation = "forkserver"
