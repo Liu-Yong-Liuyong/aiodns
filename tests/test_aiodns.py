@@ -1670,6 +1670,133 @@ async def test_concurrent_queries_mixed_types() -> None:
         await resolver.close()
 
 
+##11/27 added
+@pytest.mark.asyncio
+async def test_concurrent_queries_error_details() -> None:
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+
+    callbacks: dict[str, Callable[..., None]] = {}
+
+    def fake_query(
+        host: str,
+        qtype: int,
+        *,
+        callback: Callable[..., None],
+        **kwargs: Any,
+    ) -> None:
+        callbacks[host] = callback
+
+    try:
+        with patch.object(resolver, '_channel') as channel:
+            channel.query.side_effect = fake_query
+
+            future_a = resolver.query_dns('a.example', 'A')
+            future_b = resolver.query_dns('b.example', 'A')
+            future_c = resolver.query_dns('c.example', 'A')
+
+            assert not future_a.done()
+            assert not future_b.done()
+            assert not future_c.done()
+
+            result_a = Mock(name='result_a')
+            result_c = Mock(name='result_c')
+
+            error_code = aiodns.error.ARES_ENOTFOUND
+            expected_message = pycares.errno.strerror(error_code)
+
+            # Complete queries in a different order.
+            callbacks['c.example'](result_c, None)
+            callbacks['b.example'](None, error_code)
+            callbacks['a.example'](result_a, None)
+
+            await asyncio.sleep(0)
+
+            results = await asyncio.gather(
+                future_a,
+                future_b,
+                future_c,
+                return_exceptions=True,
+            )
+
+            assert results[0] is result_a
+            assert results[2] is result_c
+
+            dns_error = results[1]
+            assert isinstance(dns_error, aiodns.error.DNSError)
+
+            # Verify the complete DNS error information.
+            assert dns_error.args == (
+                error_code,
+                expected_message,
+            )
+
+            assert all(
+                future.done() for future in (future_a, future_b, future_c)
+            )
+
+    finally:
+        await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_queries_mixed_classes() -> None:
+    loop = asyncio.get_running_loop()
+    resolver = aiodns.DNSResolver(loop=loop)
+
+    callbacks: dict[str, Callable[..., None]] = {}
+    query_params: dict[str, tuple[int, int | None]] = {}
+
+    def fake_query(
+        host: str,
+        qtype: int,
+        *,
+        callback: Callable[..., None],
+        **kwargs: Any,
+    ) -> None:
+        callbacks[host] = callback
+        query_params[host] = (qtype, kwargs.get('query_class'))
+
+    try:
+        with patch.object(resolver, '_channel') as channel:
+            channel.query.side_effect = fake_query
+
+            future_a = resolver.query_dns('a.example', 'A', 'IN')
+            future_b = resolver.query_dns('b.example', 'TXT', 'CHAOS')
+
+            # Both queries should remain pending.
+            assert not future_a.done()
+            assert not future_b.done()
+
+            # Verify that each query preserves its own type and class.
+            assert query_params['a.example'] == (
+                pycares.QUERY_TYPE_A,
+                pycares.QUERY_CLASS_IN,
+            )
+            assert query_params['b.example'] == (
+                pycares.QUERY_TYPE_TXT,
+                pycares.QUERY_CLASS_CHAOS,
+            )
+
+            result_a = Mock(name='result_a')
+            result_b = Mock(name='result_b')
+
+            # Complete queries in reverse order.
+            callbacks['b.example'](result_b, None)
+            callbacks['a.example'](result_a, None)
+
+            await asyncio.sleep(0)
+
+            results = await asyncio.gather(future_a, future_b)
+
+            # Verify Future-Result association.
+            assert results[0] is result_a
+            assert results[1] is result_b
+
+    finally:
+        await resolver.close()
+
+
 @pytest.mark.asyncio
 async def test_resolver_cancel_pending_queries() -> None:
     """resolver.cancel() fails every pending query with ARES_ECANCELLED.
