@@ -1,0 +1,5 @@
+    aiodns.xǁDNSResolverǁ_callback__mutmut_1: timeout
+    aiodns.xǁDNSResolverǁ_callback__mutmut_2: timeout
+    aiodns.xǁDNSResolverǁ_callback__mutmut_4: survived
+    aiodns.xǁDNSResolverǁ_callback__mutmut_6: survived
+    aiodns.xǁDNSResolverǁ_callback__mutmut_7: timeout

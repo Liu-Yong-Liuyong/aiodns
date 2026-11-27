@@ -1,0 +1,7 @@
+    aiodns.xǁDNSResolverǁ_get_future_callback__mutmut_4: timeout
+    aiodns.xǁDNSResolverǁ_get_future_callback__mutmut_5: timeout
+    aiodns.xǁDNSResolverǁ_get_future_callback__mutmut_6: timeout
+    aiodns.xǁDNSResolverǁ_get_future_callback__mutmut_7: timeout
+    aiodns.xǁDNSResolverǁ_get_future_callback__mutmut_8: timeout
+    aiodns.xǁDNSResolverǁ_get_future_callback__mutmut_11: timeout
+    aiodns.xǁDNSResolverǁ_get_future_callback__mutmut_13: timeout

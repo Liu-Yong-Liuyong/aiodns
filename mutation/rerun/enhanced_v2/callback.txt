@@ -1,0 +1,1 @@
+    aiodns.xǁDNSResolverǁ_callback__mutmut_1: timeout
